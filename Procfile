@@ -1,0 +1,1 @@
+worker: python pdf_generator.py
