@@ -59,6 +59,11 @@ API_KEY_HEADER = "X-API-KEY"
 API_KEY_ENV_VAR = "INTERNAL_API_KEY"
 _AUTH_WARNING_EMITTED = False
 
+PAGE_WIDTH, PAGE_HEIGHT = A4
+DEFAULT_MARGIN = 36
+MAX_CONTENT_WIDTH = PAGE_WIDTH - (2 * DEFAULT_MARGIN)
+MAX_CONTENT_HEIGHT = PAGE_HEIGHT - (2 * DEFAULT_MARGIN)
+
 
 def configure_logging(level_name: str) -> None:
     level = getattr(logging, level_name.upper(), logging.INFO)
@@ -354,6 +359,36 @@ def resolve_image_path(base_dir: Path, path_value: str) -> Path:
     return (base_dir / candidate).resolve()
 
 
+def clamp_image_flowable(image: Image, *, source: str = "") -> None:
+    try:
+        width = float(getattr(image, "drawWidth", 0))
+        height = float(getattr(image, "drawHeight", 0))
+    except (TypeError, ValueError):
+        return
+
+    max_width = MAX_CONTENT_WIDTH
+    max_height = MAX_CONTENT_HEIGHT
+
+    if width <= 0 or height <= 0:
+        return
+
+    width_scale = max_width / width if width > max_width else 1.0
+    height_scale = max_height / height if height > max_height else 1.0
+    scale = min(width_scale, height_scale, 1.0)
+
+    if scale < 1.0:
+        logging.debug(
+            "Redimensionando imagen %s de %.2f x %.2f a %.2f x %.2f",
+            source or "<unknown>",
+            width,
+            height,
+            width * scale,
+            height * scale,
+        )
+        image.drawWidth = width * scale
+        image.drawHeight = height * scale
+
+
 def render_image(element: Dict[str, Any], story: List[Any], base_dir: Path, styles: StyleSheet1, temp_files: List[Path]) -> None:
     # Verificar si es imagen desde Supabase
     supabase_config = element.get("supabase")
@@ -402,7 +437,9 @@ def render_image(element: Dict[str, Any], story: List[Any], base_dir: Path, styl
     width = to_inches(element.get("width"))
     height = to_inches(element.get("height"))
 
-    img = Image(str(img_path), width=width, height=height) if (width or height) else Image(str(img_path))
+    source_name = str(img_path)
+    img = Image(source_name, width=width, height=height) if (width or height) else Image(source_name)
+    clamp_image_flowable(img, source=source_name)
     story.append(img)
     caption = element.get("caption")
     if caption:
