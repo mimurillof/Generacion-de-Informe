@@ -4,8 +4,12 @@ import json
 import logging
 import os
 import tempfile
+from datetime import datetime
+from hmac import compare_digest
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, cast
+
+from flask import Flask, jsonify, request
 
 from jsonschema import Draft7Validator, validate
 from reportlab.lib import colors
@@ -44,6 +48,177 @@ from reportlab.platypus import (
 
 # Local modules
 from data_sources import download_image_from_supabase, cleanup_temp_files
+
+
+BASE_DIR = Path(__file__).resolve().parent
+DEFAULT_JSON_PATH = (BASE_DIR / "estructura_informe.json").resolve()
+DEFAULT_SCHEMA_PATH = (BASE_DIR / "schema" / "report_schema.json").resolve()
+DEFAULT_LOG_LEVEL = os.getenv("PDF_SERVICE_LOG_LEVEL", "INFO")
+USE_DEFAULT_SCHEMA = object()
+API_KEY_HEADER = "X-API-KEY"
+API_KEY_ENV_VAR = "INTERNAL_API_KEY"
+_AUTH_WARNING_EMITTED = False
+
+
+def configure_logging(level_name: str) -> None:
+    level = getattr(logging, level_name.upper(), logging.INFO)
+    root_logger = logging.getLogger()
+    if not root_logger.handlers:
+        logging.basicConfig(level=level, format="%(levelname)s: %(message)s")
+    else:
+        root_logger.setLevel(level)
+
+
+def resolve_json_path(json_path_param: Optional[str], allow_download: bool) -> Path:
+    if json_path_param:
+        json_path = Path(json_path_param).expanduser().resolve()
+    else:
+        json_path = DEFAULT_JSON_PATH
+
+    if not allow_download and not json_path.exists():
+        raise FileNotFoundError(
+            f"No existe el archivo JSON especificado: {json_path}. Habilita la descarga automática o sube el archivo."
+        )
+
+    return json_path
+
+
+def resolve_schema_path(schema_path_param: object) -> Optional[Path]:
+    if schema_path_param is USE_DEFAULT_SCHEMA:
+        return DEFAULT_SCHEMA_PATH
+    if schema_path_param in (None, "", False):
+        return None
+    if isinstance(schema_path_param, Path):
+        return schema_path_param
+    return Path(str(schema_path_param)).expanduser().resolve()
+
+
+def resolve_output_path(output_path_param: Optional[str]) -> Optional[Path]:
+    if not output_path_param:
+        return None
+    return Path(output_path_param).expanduser().resolve()
+
+
+def sanitize_for_json(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {key: sanitize_for_json(val) for key, val in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [sanitize_for_json(item) for item in value]
+    return value
+
+
+def execute_generation(
+    *,
+    json_path_param: Optional[str] = None,
+    schema_path_param: object = USE_DEFAULT_SCHEMA,
+    output_path_param: Optional[str] = None,
+    allow_download: bool = True,
+    allow_upload: bool = True,
+    log_level: str = DEFAULT_LOG_LEVEL,
+) -> Tuple[Path, Optional[Path], Optional[Path], Path, Optional[Dict[str, Any]]]:
+    configure_logging(log_level)
+    resolved_json_path = resolve_json_path(json_path_param, allow_download)
+    resolved_schema_path = resolve_schema_path(schema_path_param)
+    resolved_output_path = resolve_output_path(output_path_param)
+
+    pdf_path, upload_info = build_pdf_from_json(
+        json_path=resolved_json_path,
+        schema_path=resolved_schema_path,
+        output_path=resolved_output_path,
+        upload_to_supabase=allow_upload,
+    )
+
+    return resolved_json_path, resolved_schema_path, resolved_output_path, pdf_path, upload_info
+
+
+configure_logging(DEFAULT_LOG_LEVEL)
+app = Flask(__name__)
+
+
+def is_request_authorized() -> bool:
+    global _AUTH_WARNING_EMITTED
+    expected_key = os.getenv(API_KEY_ENV_VAR)
+    if not expected_key:
+        if not _AUTH_WARNING_EMITTED:
+            logging.warning(
+                "INTERNAL_API_KEY no configurado; el endpoint /run acepta peticiones sin autenticación."
+            )
+            _AUTH_WARNING_EMITTED = True
+        return True
+
+    provided_key = request.headers.get(API_KEY_HEADER, "")
+    return bool(provided_key) and compare_digest(provided_key, expected_key)
+
+
+@app.get("/health")
+def health_check() -> Any:
+    return jsonify({"status": "ok"}), 200
+
+
+@app.post("/run")
+def run_pdf_generation() -> Any:
+    if not is_request_authorized():
+        return jsonify({"status": "error", "message": "No autorizado"}), 401
+
+    payload = request.get_json(silent=True) or {}
+
+    log_level = payload.get("log_level") or DEFAULT_LOG_LEVEL
+    allow_download = not bool(payload.get("no_download", False))
+    allow_upload = not bool(payload.get("no_upload", False))
+
+    if "schema_path" in payload:
+        schema_param = payload.get("schema_path")
+    else:
+        schema_param = USE_DEFAULT_SCHEMA
+
+    try:
+        (
+            resolved_json_path,
+            resolved_schema_path,
+            resolved_output_path,
+            pdf_path,
+            upload_info,
+        ) = execute_generation(
+            json_path_param=payload.get("json_path"),
+            schema_path_param=schema_param,
+            output_path_param=payload.get("output_path"),
+            allow_download=allow_download,
+            allow_upload=allow_upload,
+            log_level=log_level,
+        )
+    except FileNotFoundError as exc:
+        logging.warning("Solicitud inválida: %s", exc)
+        return jsonify({"status": "error", "message": str(exc)}), 400
+    except Exception as exc:
+        logging.exception("Error generando PDF desde el servicio")
+        return jsonify({"status": "error", "message": str(exc)}), 500
+
+    upload_success = bool(isinstance(upload_info, dict) and upload_info.get("success"))
+    response_payload: Dict[str, Any] = {
+        "status": "success",
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+        "pdf_path": str(pdf_path),
+        "source_json": str(resolved_json_path),
+        "upload_to_supabase": allow_upload,
+    }
+
+    if resolved_schema_path is not None:
+        response_payload["schema_path"] = str(resolved_schema_path)
+    if resolved_output_path is not None:
+        response_payload["output_path"] = str(resolved_output_path)
+
+    if upload_info is not None:
+        response_payload["upload_info"] = sanitize_for_json(upload_info)
+        if upload_success:
+            response_payload["message"] = "PDF subido exitosamente a Supabase."
+        else:
+            response_payload["message"] = "PDF generado; revisa la respuesta de Supabase."
+    else:
+        response_payload["message"] = "PDF generado localmente."
+
+    return jsonify(response_payload), 200
 
 
 class NumberedCanvas(Canvas):
@@ -508,8 +683,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--schema",
         dest="schema_path",
-        default=str(Path("schema") / "report_schema.json"),
-        help="Ruta al archivo JSON Schema para validar la entrada",
+        default=None,
+        help="Ruta al archivo JSON Schema para validar la entrada (usa el valor por defecto del proyecto si no se especifica)",
     )
     parser.add_argument("--output", dest="output", default=None, help="Ruta de salida opcional del PDF")
     parser.add_argument(
@@ -536,45 +711,50 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    logging.basicConfig(level=getattr(logging, args.log_level), format="%(levelname)s: %(message)s")
-    
-    # Determinar ruta del JSON
-    if args.json_path:
-        json_path = Path(args.json_path).resolve()
-        if not json_path.exists() and args.no_download:
-            raise FileNotFoundError(f"No existe el archivo JSON: {json_path}")
+    allow_download = not args.no_download
+    allow_upload = not args.no_upload
+
+    schema_param: object
+    if args.schema_path is None:
+        schema_param = USE_DEFAULT_SCHEMA
     else:
-        # Modo automático: usar archivo por defecto o descargar desde Supabase
-        json_path = Path("estructura_informe.json")
-        if args.no_download and not json_path.exists():
-            raise FileNotFoundError(f"No existe el archivo JSON por defecto: {json_path} (descarga deshabilitada)")
+        schema_param = args.schema_path
 
-    schema_path = Path(args.schema_path).resolve() if args.schema_path else None
-    output_path = Path(args.output).resolve() if args.output else None
-    
-    # Determinar si se debe subir a Supabase (por defecto SÍ, a menos que se use --no-upload)
-    upload_to_supabase = not args.no_upload
-
-    # Generar PDF
-    pdf_path, upload_info = build_pdf_from_json(
-        json_path=json_path, 
-        schema_path=schema_path, 
-        output_path=output_path,
-        upload_to_supabase=upload_to_supabase
+    (
+        resolved_json_path,
+        resolved_schema_path,
+        resolved_output_path,
+        pdf_path,
+        upload_info,
+    ) = execute_generation(
+        json_path_param=args.json_path,
+        schema_path_param=schema_param,
+        output_path_param=args.output,
+        allow_download=allow_download,
+        allow_upload=allow_upload,
+        log_level=args.log_level,
     )
-    
-    # Mostrar resultados
-    if upload_to_supabase and upload_info and upload_info.get("success"):
+
+    upload_data: Optional[Dict[str, Any]] = upload_info if isinstance(upload_info, dict) else None
+    upload_success = bool(upload_data and upload_data.get("success"))
+
+    if allow_upload and upload_success and upload_data:
         print("PDF subido exitosamente a Supabase:")
-        print(f"   Ubicación: {upload_info['remote_path']}")
-        print(f"   Tamaño: {upload_info['file_size_mb']} MB")
-        if upload_info.get("public_url"):
-            print(f"   URL: {upload_info['public_url']}")
+        print(f"   Ubicación: {upload_data['remote_path']}")
+        print(f"   Tamaño: {upload_data['file_size_mb']} MB")
+        public_url = upload_data.get("public_url")
+        if public_url:
+            print(f"   URL: {public_url}")
     else:
         print(f"PDF generado localmente: {pdf_path}")
         if pdf_path.exists():
             size_mb = pdf_path.stat().st_size / (1024 * 1024)
             print(f"   Tamaño: {size_mb:.2f} MB")
+
+    if resolved_schema_path:
+        print(f"Validación con schema: {resolved_schema_path}")
+    if resolved_output_path:
+        print(f"Archivo de salida: {resolved_output_path}")
 
 
 if __name__ == "__main__":

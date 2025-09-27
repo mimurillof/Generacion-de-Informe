@@ -1,1 +1,1 @@
-worker: python pdf_generator.py
+web: gunicorn pdf_generator:app
