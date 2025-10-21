@@ -478,7 +478,15 @@ def render_image(element: Dict[str, Any], story: List[Any], base_dir: Path, styl
     height = to_inches(element.get("height"))
 
     source_name = str(img_path)
-    img = Image(source_name, width=width, height=height) if (width or height) else Image(source_name)
+    
+    # ✅ SIEMPRE crear imagen con tamaño máximo inicial si no se especifica
+    if not width and not height:
+        # Usar ancho máximo por defecto para evitar LayoutError
+        img = Image(source_name, width=MAX_CONTENT_WIDTH * 0.9)
+    else:
+        img = Image(source_name, width=width, height=height)
+    
+    # ✅ Aplicar clamp para asegurar que cabe en la página
     clamp_image_flowable(img, source=source_name)
     story.append(img)
     caption = element.get("caption")
