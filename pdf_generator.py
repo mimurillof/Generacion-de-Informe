@@ -481,8 +481,9 @@ def render_image(element: Dict[str, Any], story: List[Any], base_dir: Path, styl
     
     # ✅ SIEMPRE crear imagen con tamaño máximo inicial si no se especifica
     if not width and not height:
-        # Usar ancho máximo por defecto para evitar LayoutError
-        img = Image(source_name, width=MAX_CONTENT_WIDTH * 0.9)
+        # Usar ancho máximo más conservador para evitar LayoutError
+        # Reducimos a 80% del espacio disponible para dar más margen
+        img = Image(source_name, width=MAX_CONTENT_WIDTH * 0.8)
     else:
         img = Image(source_name, width=width, height=height)
     
