@@ -202,7 +202,8 @@ def cleanup_temp_files_if_enabled(temp_files: list[Path]) -> None:
 
 def download_json_structure_from_supabase(
     json_filename: str = "estructura_informe.json",
-    local_fallback_path: Optional[str] = None
+    local_fallback_path: Optional[str] = None,
+    user_id: Optional[str] = None  # ✅ NUEVO: Requerido para multiusuario
 ) -> Path:
     """
     Descarga el archivo JSON de estructura del informe desde Supabase.
@@ -210,19 +211,24 @@ def download_json_structure_from_supabase(
     Args:
         json_filename: Nombre del archivo JSON en Supabase
         local_fallback_path: Ruta local alternativa si falla la descarga
+        user_id: ID del usuario propietario del JSON (requerido para multiusuario)
         
     Returns:
         Path: Ruta al archivo JSON descargado (temporal) o local fallback
         
     Raises:
         FileNotFoundError: Si no se puede descargar ni encontrar archivo local
+        ValueError: Si user_id no se proporciona
     """
+    if not user_id:
+        raise ValueError("user_id es requerido para descargar JSON de Supabase en modo multiusuario")
+    
     try:
         client = get_supabase_client()
         bucket = client.storage.from_(Config.SUPABASE_BUCKET_NAME)
         
-        # Construir la ruta en Supabase: Informes/estructura_informe.json
-        supabase_path = f"Informes/{json_filename}"
+        # Construir la ruta en Supabase: {user_id}/estructura_informe.json (✅ MULTIUSUARIO)
+        supabase_path = f"{user_id}/{json_filename}"
         
         logging.info(f"🔽 Descargando JSON desde Supabase: {supabase_path}")
         
@@ -276,7 +282,8 @@ def download_json_structure_from_supabase(
 def upload_pdf_to_supabase(
     local_pdf_path: Path,
     remote_filename: str = "Reporte.pdf",
-    remote_folder: str = "Informes"
+    remote_folder: Optional[str] = None,  # ✅ MODIFICADO: Ahora opcional
+    user_id: Optional[str] = None  # ✅ NUEVO: Requerido para multiusuario
 ) -> Dict[str, Any]:
     """
     Sube un archivo PDF a Supabase Storage usando upsert=True.
@@ -284,24 +291,29 @@ def upload_pdf_to_supabase(
     Args:
         local_pdf_path: Ruta local al archivo PDF
         remote_filename: Nombre del archivo en Supabase (sin versiones)
-        remote_folder: Carpeta destino en Supabase
+        remote_folder: (DEPRECATED) Carpeta destino - se ignora en modo multiusuario
+        user_id: ID del usuario propietario del PDF (requerido para multiusuario)
         
     Returns:
         Dict con información de la subida (success, url, etc.)
         
     Raises:
         FileNotFoundError: Si el archivo local no existe
+        ValueError: Si user_id no se proporciona
         Exception: Si falla la subida a Supabase
     """
     if not local_pdf_path.exists():
         raise FileNotFoundError(f"Archivo PDF no encontrado: {local_pdf_path}")
     
+    if not user_id:
+        raise ValueError("user_id es requerido para subir PDF a Supabase en modo multiusuario")
+    
     try:
         client = get_supabase_client()
         bucket = client.storage.from_(Config.SUPABASE_BUCKET_NAME)
         
-        # Construir la ruta remota: Informes/informe_estrategico.pdf
-        remote_path = f"{remote_folder}/{remote_filename}".strip("/")
+        # Construir la ruta remota: {user_id}/Reporte.pdf (✅ MULTIUSUARIO)
+        remote_path = f"{user_id}/{remote_filename}".strip("/")
         
         # Obtener tamaño del archivo
         file_size = local_pdf_path.stat().st_size

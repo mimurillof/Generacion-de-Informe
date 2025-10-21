@@ -122,7 +122,23 @@ def execute_generation(
     allow_download: bool = True,
     allow_upload: bool = True,
     log_level: str = DEFAULT_LOG_LEVEL,
+    user_id: Optional[str] = None  # ✅ NUEVO: Requerido para multiusuario
 ) -> Tuple[Path, Optional[Path], Optional[Path], Path, Optional[Dict[str, Any]]]:
+    """
+    Ejecuta la generación de PDF con los parámetros especificados.
+    
+    Args:
+        json_path_param: Ruta al JSON local (opcional)
+        schema_path_param: Ruta al schema de validación
+        output_path_param: Ruta de salida del PDF (opcional)
+        allow_download: Si debe descargar desde Supabase
+        allow_upload: Si debe subir a Supabase
+        log_level: Nivel de logging
+        user_id: ID del usuario propietario (requerido para multiusuario)
+        
+    Returns:
+        Tuple con rutas y metadata de la generación
+    """
     configure_logging(log_level)
     resolved_json_path = resolve_json_path(json_path_param, allow_download)
     resolved_schema_path = resolve_schema_path(schema_path_param)
@@ -133,6 +149,7 @@ def execute_generation(
         schema_path=resolved_schema_path,
         output_path=resolved_output_path,
         upload_to_supabase=allow_upload,
+        user_id=user_id  # ✅ MULTIUSUARIO
     )
 
     return resolved_json_path, resolved_schema_path, resolved_output_path, pdf_path, upload_info
@@ -164,10 +181,32 @@ def health_check() -> Any:
 
 @app.post("/run")
 def run_pdf_generation() -> Any:
+    """
+    Endpoint Flask para generar PDF desde JSON.
+    
+    Payload esperado:
+    {
+        "user_id": "user_123",  // ✅ REQUERIDO para multiusuario
+        "json_path": "...",     // Opcional
+        "schema_path": "...",   // Opcional
+        "output_path": "...",   // Opcional
+        "log_level": "INFO",    // Opcional
+        "no_download": false,   // Opcional
+        "no_upload": false      // Opcional
+    }
+    """
     if not is_request_authorized():
         return jsonify({"status": "error", "message": "No autorizado"}), 401
 
     payload = request.get_json(silent=True) or {}
+
+    # ✅ NUEVO: Validar user_id (requerido para multiusuario)
+    user_id = payload.get("user_id")
+    if not user_id:
+        return jsonify({
+            "status": "error",
+            "message": "user_id es requerido para generar PDF en modo multiusuario"
+        }), 400
 
     log_level = payload.get("log_level") or DEFAULT_LOG_LEVEL
     allow_download = not bool(payload.get("no_download", False))
@@ -192,6 +231,7 @@ def run_pdf_generation() -> Any:
             allow_download=allow_download,
             allow_upload=allow_upload,
             log_level=log_level,
+            user_id=user_id  # ✅ MULTIUSUARIO
         )
     except FileNotFoundError as exc:
         logging.warning("Solicitud inválida: %s", exc)
@@ -530,7 +570,8 @@ def build_story(content: List[Dict[str, Any]], styles: StyleSheet1, base_dir: Pa
 def get_json_structure(
     json_path: Optional[Path] = None,
     auto_download: bool = True,
-    json_filename: str = "estructura_informe.json"
+    json_filename: str = "estructura_informe.json",
+    user_id: Optional[str] = None  # ✅ NUEVO: Requerido para multiusuario
 ) -> Tuple[Path, bool]:
     """
     Obtiene el archivo JSON de estructura, descargándolo desde Supabase si está habilitado.
@@ -539,9 +580,13 @@ def get_json_structure(
         json_path: Ruta local específica al JSON (opcional)
         auto_download: Si debe intentar descargar desde Supabase primero
         json_filename: Nombre del archivo JSON en Supabase
+        user_id: ID del usuario propietario del JSON (requerido para descarga desde Supabase)
         
     Returns:
         Tuple[Path, bool]: (ruta_al_json, es_temporal)
+        
+    Raises:
+        ValueError: Si user_id no se proporciona y auto_download=True
     """
     # Si se especifica una ruta local y existe, usarla directamente
     if json_path and json_path.exists():
@@ -550,6 +595,9 @@ def get_json_structure(
     
     # Intentar descargar desde Supabase si está habilitado
     if auto_download and download_json_structure_from_supabase:
+        if not user_id:
+            raise ValueError("user_id es requerido para descargar JSON desde Supabase en modo multiusuario")
+        
         try:
             # Construir fallback local
             local_fallback = json_path or Path(json_filename)
@@ -557,7 +605,8 @@ def get_json_structure(
             logging.info("🌐 Intentando descargar JSON desde Supabase...")
             json_temp_path = download_json_structure_from_supabase(
                 json_filename=json_filename,
-                local_fallback_path=str(local_fallback) if local_fallback.exists() else None
+                local_fallback_path=str(local_fallback) if local_fallback.exists() else None,
+                user_id=user_id  # ✅ MULTIUSUARIO
             )
             
             return json_temp_path, True
@@ -578,7 +627,8 @@ def build_pdf_from_json(
     json_path: Path, 
     schema_path: Optional[Path] = None, 
     output_path: Optional[Path] = None,
-    upload_to_supabase: bool = True
+    upload_to_supabase: bool = True,
+    user_id: Optional[str] = None  # ✅ NUEVO: Requerido para multiusuario
 ) -> Tuple[Path, Optional[Dict[str, Any]]]:
     """
     Genera un PDF desde JSON y opcionalmente lo sube a Supabase.
@@ -588,12 +638,16 @@ def build_pdf_from_json(
         schema_path: Ruta al schema de validación
         output_path: Ruta de salida (opcional, se usa temporal si upload_to_supabase=True)
         upload_to_supabase: Si debe subir automáticamente a Supabase
+        user_id: ID del usuario propietario del PDF (requerido para multiusuario)
         
     Returns:
         Tuple[Path, Optional[Dict]]: (ruta_pdf_local, info_subida_supabase)
+        
+    Raises:
+        ValueError: Si user_id no se proporciona cuando es necesario
     """
     # Obtener el JSON (desde Supabase o local)
-    actual_json_path, is_temp_json = get_json_structure(json_path, auto_download=True)
+    actual_json_path, is_temp_json = get_json_structure(json_path, auto_download=True, user_id=user_id)
     
     # Determinar archivo de salida (temporal si se va a subir a Supabase)
     if upload_to_supabase and upload_pdf_to_supabase:
@@ -651,22 +705,25 @@ def build_pdf_from_json(
             
             # Subir a Supabase si está habilitado
             if upload_to_supabase and upload_pdf_to_supabase:
-                try:
-                    # Usar nombre fijo simple
-                    remote_filename = "Reporte.pdf"
-                    
-                    logging.info("📤 Subiendo PDF a Supabase...")
-                    upload_info = upload_pdf_to_supabase(
-                        local_pdf_path=output_file,
-                        remote_filename=remote_filename,
-                        remote_folder="Informes"
-                    )
-                    
-                    logging.info("🌐 PDF subido exitosamente a Supabase: %s", upload_info["remote_path"])
-                    
-                except Exception as e:
-                    logging.error("❌ Error subiendo PDF a Supabase: %s", e)
-                    upload_info = {"success": False, "error": str(e)}
+                if not user_id:
+                    logging.warning("⚠️ user_id no proporcionado, omitiendo subida a Supabase")
+                else:
+                    try:
+                        # Usar nombre fijo simple
+                        remote_filename = "Reporte.pdf"
+                        
+                        logging.info("📤 Subiendo PDF a Supabase...")
+                        upload_info = upload_pdf_to_supabase(
+                            local_pdf_path=output_file,
+                            remote_filename=remote_filename,
+                            user_id=user_id  # ✅ MULTIUSUARIO
+                        )
+                        
+                        logging.info("🌐 PDF subido exitosamente a Supabase: %s", upload_info["remote_path"])
+                        
+                    except Exception as e:
+                        logging.error("❌ Error subiendo PDF a Supabase: %s", e)
+                        upload_info = {"success": False, "error": str(e)}
             
         finally:
             # Limpiar archivos temporales descargados de Supabase (imágenes)
@@ -712,6 +769,12 @@ def build_pdf_from_json(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generador de informes PDF basado en JSON")
     parser.add_argument(
+        "--user-id",
+        dest="user_id",
+        required=False,
+        help="ID del usuario propietario del PDF (requerido para descarga/subida desde Supabase)"
+    )
+    parser.add_argument(
         "--json", 
         dest="json_path", 
         required=False, 
@@ -747,9 +810,18 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """
+    Función principal para ejecución desde CLI.
+    """
     args = parse_args()
     allow_download = not args.no_download
     allow_upload = not args.no_upload
+
+    # ✅ NUEVO: Validar user_id si se requiere descarga/subida
+    if (allow_download or allow_upload) and not args.user_id:
+        print("❌ Error: --user-id es requerido cuando se usa descarga/subida desde Supabase")
+        print("   Usa --no-download y --no-upload para trabajar solo con archivos locales")
+        return
 
     schema_param: object
     if args.schema_path is None:
@@ -770,6 +842,7 @@ def main() -> None:
         allow_download=allow_download,
         allow_upload=allow_upload,
         log_level=args.log_level,
+        user_id=args.user_id  # ✅ MULTIUSUARIO
     )
 
     upload_data: Optional[Dict[str, Any]] = upload_info if isinstance(upload_info, dict) else None
