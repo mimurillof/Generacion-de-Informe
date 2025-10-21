@@ -409,7 +409,16 @@ def clamp_image_flowable(image: Image, *, source: str = "") -> None:
     max_width = MAX_CONTENT_WIDTH
     max_height = MAX_CONTENT_HEIGHT
 
+    # ✅ Si no hay dimensiones, forzar tamaño seguro basado en los límites
     if width <= 0 or height <= 0:
+        logging.warning(
+            "Imagen %s sin dimensiones válidas, forzando tamaño seguro: %.2f x %.2f",
+            source or "<unknown>",
+            max_width * 0.7,
+            max_height * 0.7
+        )
+        image.drawWidth = max_width * 0.7
+        image.drawHeight = max_height * 0.7
         return
 
     width_scale = max_width / width if width > max_width else 1.0
@@ -479,16 +488,18 @@ def render_image(element: Dict[str, Any], story: List[Any], base_dir: Path, styl
 
     source_name = str(img_path)
     
-    # ✅ SIEMPRE crear imagen con tamaño máximo inicial si no se especifica
-    if not width and not height:
-        # Usar ancho máximo más conservador para evitar LayoutError
-        # Reducimos a 80% del espacio disponible para dar más margen
-        img = Image(source_name, width=MAX_CONTENT_WIDTH * 0.8)
-    else:
-        img = Image(source_name, width=width, height=height)
+    # ✅ Crear imagen y aplicar escalado inmediatamente
+    img = Image(source_name, width=width, height=height) if (width or height) else Image(source_name)
     
-    # ✅ Aplicar clamp para asegurar que cabe en la página
+    # ✅ CRÍTICO: Aplicar clamp SIEMPRE para asegurar que cabe en la página
+    # Esto ajustará las dimensiones antes de agregar al story
     clamp_image_flowable(img, source=source_name)
+    
+    # ✅ Si clamp no estableció dimensiones válidas, forzar un tamaño seguro
+    if not hasattr(img, 'drawWidth') or not hasattr(img, 'drawHeight'):
+        img.drawWidth = MAX_CONTENT_WIDTH * 0.7
+        img.drawHeight = MAX_CONTENT_HEIGHT * 0.7
+    
     story.append(img)
     caption = element.get("caption")
     if caption:
