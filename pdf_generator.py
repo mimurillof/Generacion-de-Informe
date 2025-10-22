@@ -63,6 +63,8 @@ PAGE_WIDTH, PAGE_HEIGHT = A4
 DEFAULT_MARGIN = 36
 MAX_CONTENT_WIDTH = PAGE_WIDTH - (2 * DEFAULT_MARGIN)
 MAX_CONTENT_HEIGHT = PAGE_HEIGHT - (2 * DEFAULT_MARGIN)
+MAX_IMAGE_WIDTH = MAX_CONTENT_WIDTH
+MAX_IMAGE_HEIGHT = MAX_CONTENT_HEIGHT * 0.75
 
 
 def configure_logging(level_name: str) -> None:
@@ -342,12 +344,22 @@ def build_styles() -> StyleSheet1:
     return styles
 
 
-def to_inches(value: Optional[float]) -> Optional[float]:
+def to_inches(value: Any) -> Optional[float]:
     if value is None:
         return None
     try:
+        if isinstance(value, str):
+            stripped = value.strip().lower()
+            if stripped.endswith("cm"):
+                return float(stripped[:-2]) / 2.54 * inch
+            if stripped.endswith("mm"):
+                return float(stripped[:-2]) / 25.4 * inch
+            if stripped.endswith("in"):
+                return float(stripped[:-2]) * inch
+            return float(stripped) * inch
         return float(value) * inch
     except Exception:
+        logging.warning("No se pudo convertir valor a pulgadas: %s", value)
         return None
 
 
@@ -406,19 +418,21 @@ def clamp_image_flowable(image: Image, *, source: str = "") -> None:
     except (TypeError, ValueError):
         return
 
-    max_width = MAX_CONTENT_WIDTH
-    max_height = MAX_CONTENT_HEIGHT
+    max_width = MAX_IMAGE_WIDTH
+    max_height = MAX_IMAGE_HEIGHT
 
-    # ✅ Si no hay dimensiones, forzar tamaño seguro basado en los límites
     if width <= 0 or height <= 0:
         logging.warning(
             "Imagen %s sin dimensiones válidas, forzando tamaño seguro: %.2f x %.2f",
             source or "<unknown>",
             max_width * 0.7,
-            max_height * 0.7
+            max_height * 0.7,
         )
         image.drawWidth = max_width * 0.7
         image.drawHeight = max_height * 0.7
+        return
+
+    if width <= max_width and height <= max_height:
         return
 
     width_scale = max_width / width if width > max_width else 1.0
@@ -437,15 +451,26 @@ def clamp_image_flowable(image: Image, *, source: str = "") -> None:
         image.drawWidth = width * scale
         image.drawHeight = height * scale
 
+    if image.drawWidth > max_width:
+        image.drawWidth = max_width
+    if image.drawHeight > max_height:
+        image.drawHeight = max_height
+
 
 def render_image(element: Dict[str, Any], story: List[Any], base_dir: Path, styles: StyleSheet1, temp_files: List[Path]) -> None:
-    # Verificar si es imagen desde Supabase
     supabase_config = element.get("supabase")
+    img_path: Optional[Path] = None
+
     if supabase_config:
         if download_image_from_supabase:
-            img_path = download_image_from_supabase(supabase_config)
-            if img_path:
-                temp_files.append(img_path)  # Agregar a lista para limpieza posterior
+            try:
+                downloaded = download_image_from_supabase(supabase_config)
+            except Exception as exc:
+                logging.warning("Error descargando imagen desde Supabase: %s", exc)
+                return
+            if downloaded:
+                img_path = Path(downloaded)
+                temp_files.append(img_path)
             else:
                 logging.warning("No se pudo descargar imagen desde Supabase. Se omite.")
                 return
@@ -453,54 +478,50 @@ def render_image(element: Dict[str, Any], story: List[Any], base_dir: Path, styl
             logging.warning("Función download_image_from_supabase no disponible. Se omite.")
             return
     else:
-        # Imagen local tradicional
         path_value = element.get("path")
         if not path_value:
             logging.warning("Elemento 'image' sin 'path' ni 'supabase'. Se omite.")
             return
-            
+
         img_path = resolve_image_path(base_dir, path_value)
-        
-        # Si no existe localmente, intentar descargar desde Supabase automáticamente
+
         if not img_path.exists():
             logging.info("Imagen no encontrada localmente: %s. Intentando descargar desde Supabase...", path_value)
-            try:
-                if create_image_config and download_image_from_supabase:
-                    # Crear configuración automática para Supabase
-                    supabase_config = create_image_config(path_value)
-                    downloaded_path = download_image_from_supabase(supabase_config)
-                    if downloaded_path and downloaded_path.exists():
-                        img_path = downloaded_path
-                        temp_files.append(img_path)  # Agregar a lista para limpieza posterior
-                        logging.info("Imagen descargada exitosamente desde Supabase: %s", path_value)
-                    else:
-                        logging.warning("No se pudo descargar imagen desde Supabase: %s. Se omite.", path_value)
-                        return
-                else:
-                    logging.warning("Funciones de Supabase no disponibles. Imagen %s omitida.", path_value)
+            if create_image_config and download_image_from_supabase:
+                try:
+                    generated_config = create_image_config(path_value)
+                    downloaded_path = download_image_from_supabase(generated_config)
+                except Exception as exc:
+                    logging.warning("Error descargando imagen desde Supabase %s: %s. Se omite.", path_value, exc)
                     return
-            except Exception as e:
-                logging.warning("Error descargando imagen desde Supabase %s: %s. Se omite.", path_value, e)
+                if downloaded_path and Path(downloaded_path).exists():
+                    img_path = Path(downloaded_path)
+                    temp_files.append(img_path)
+                    logging.info("Imagen descargada exitosamente desde Supabase: %s", path_value)
+                else:
+                    logging.warning("No se pudo descargar imagen desde Supabase: %s. Se omite.", path_value)
+                    return
+            else:
+                logging.warning("Funciones de Supabase no disponibles. Imagen %s omitida.", path_value)
                 return
+
+    if not img_path:
+        logging.warning("No se pudo resolver la ruta de la imagen: %s", element)
+        return
 
     width = to_inches(element.get("width"))
     height = to_inches(element.get("height"))
 
-    source_name = str(img_path)
-    
-    # ✅ Crear imagen y aplicar escalado inmediatamente
-    img = Image(source_name, width=width, height=height) if (width or height) else Image(source_name)
-    
-    # ✅ CRÍTICO: Aplicar clamp SIEMPRE para asegurar que cabe en la página
-    # Esto ajustará las dimensiones antes de agregar al story
-    clamp_image_flowable(img, source=source_name)
-    
-    # ✅ Si clamp no estableció dimensiones válidas, forzar un tamaño seguro
-    if not hasattr(img, 'drawWidth') or not hasattr(img, 'drawHeight'):
-        img.drawWidth = MAX_CONTENT_WIDTH * 0.7
-        img.drawHeight = MAX_CONTENT_HEIGHT * 0.7
-    
-    story.append(img)
+    image_flowable = Image(str(img_path), width=width, height=height) if (width or height) else Image(str(img_path))
+
+    clamp_image_flowable(image_flowable, source=str(img_path))
+
+    if image_flowable.drawWidth > MAX_IMAGE_WIDTH:
+        image_flowable.drawWidth = MAX_IMAGE_WIDTH
+    if image_flowable.drawHeight > MAX_IMAGE_HEIGHT:
+        image_flowable.drawHeight = MAX_IMAGE_HEIGHT
+
+    story.append(image_flowable)
     caption = element.get("caption")
     if caption:
         story.append(Spacer(1, 6))
